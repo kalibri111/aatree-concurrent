@@ -1,0 +1,14 @@
+[
+{
+  "directory": "/Users/ivanleskin/CLionProjects/aatree-concurrent/build",
+  "command": "/usr/bin/clang   -g -std=gnu11 -arch arm64 -isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX15.2.sdk -o CMakeFiles/aatree_concurrent.dir/main.c.o -c /Users/ivanleskin/CLionProjects/aatree-concurrent/main.c",
+  "file": "/Users/ivanleskin/CLionProjects/aatree-concurrent/main.c",
+  "output": "CMakeFiles/aatree_concurrent.dir/main.c.o"
+},
+{
+  "directory": "/Users/ivanleskin/CLionProjects/aatree-concurrent/build",
+  "command": "/usr/bin/clang   -g -std=gnu11 -arch arm64 -isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX15.2.sdk -o CMakeFiles/aatree_concurrent.dir/aatree.c.o -c /Users/ivanleskin/CLionProjects/aatree-concurrent/aatree.c",
+  "file": "/Users/ivanleskin/CLionProjects/aatree-concurrent/aatree.c",
+  "output": "CMakeFiles/aatree_concurrent.dir/aatree.c.o"
+}
+]
