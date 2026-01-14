@@ -30,6 +30,7 @@ struct AATree;
 struct AANode;
 
 #include <stdatomic.h>
+#include <pthread.h>
 #define USUAL_AATREE_ATOMIC(T) _Atomic(T)
 
 /** Callback for node comparision against value */
@@ -42,10 +43,11 @@ typedef void (*aatree_walker_f)(struct AANode *n, void *arg);
  * Tree header, for storing helper functions.
  */
 struct AATree {
-    struct AANode *root;
+    USUAL_AATREE_ATOMIC(struct AANode *) root;
     USUAL_AATREE_ATOMIC(int) count;
     aatree_cmp_f node_cmp;
     aatree_walker_f release_cb;
+    pthread_rwlock_t rw_lock;  /* RW lock: shared reads, exclusive writes */
 };
 
 enum AANodeState {
@@ -64,9 +66,9 @@ enum AANodeState {
  * done to keep code simple.
  */
 struct AANode {
-    USUAL_AATREE_ATOMIC(struct AANode *) parent;  /** lock-free consistency needs to mark parents */
     USUAL_AATREE_ATOMIC(struct AANode *) left;	/**<  smaller values */
     USUAL_AATREE_ATOMIC(struct AANode *) right;	/**<  larger values */
+    USUAL_AATREE_ATOMIC(struct AANode *) parent;
     USUAL_AATREE_ATOMIC(int) level;			/**<  number of black nodes to leaf */
     USUAL_AATREE_ATOMIC(enum AANodeState) state;
 };
@@ -94,6 +96,9 @@ void aatree_walk(struct AATree *tree, enum AATreeWalkType wtype, aatree_walker_f
 
 /** Free */
 void aatree_destroy(struct AATree *tree);
+
+
+void aatree_print_snapshot(struct AATree *tree, void (*value_printer)(struct AANode *));
 
 /** Check if terminal node. */
 static inline int aatree_is_nil_node(const struct AANode *node)

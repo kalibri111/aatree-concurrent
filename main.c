@@ -106,6 +106,12 @@ typedef struct {
     int count;
 } ThreadSearchArg;
 
+static void my_node_print_value(struct AANode *node)
+{
+    MyNode *my = container_of(node, MyNode, node);
+    printf("%d", my->value);
+}
+
 static void *insert_thread_func(void *arg)
 {
     ThreadInsertArg *targ = (ThreadInsertArg *)arg;
@@ -113,6 +119,7 @@ static void *insert_thread_func(void *arg)
         MyNode *my = make_node(targ->start_value + i);
         aatree_insert(targ->tree, targ->start_value + i, &my->node);
     }
+//    aatree_print_snapshot(targ->tree, my_node_print_value);
     return NULL;
 }
 
@@ -124,6 +131,8 @@ static void *search_thread_func(void *arg)
     }
     return NULL;
 }
+
+
 
 // all inserted nodes exist
 static void test_insert_concurrent_insert() {

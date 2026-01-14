@@ -116,94 +116,113 @@ static int node_atomic_get_state(Node* self) {
  * Rebalancing.  AA-tree needs only 2 operations
  * to keep the tree balanced.
  */
+static inline bool atomic_rebalancing_state_compare_exchange_weak(Node* node, enum AANodeState state) {
+    enum AANodeState expected_open = Open;
 
+    if (atomic_compare_exchange_weak(&node->state, &state, Balancing) ||
+        atomic_compare_exchange_weak(&node->state, &expected_open, Balancing)) {
+        return true;
+    }
+    return false;
+}
 /*
  * X might be participant of rebalancing up to 2 parents.
- * Start rebalancing x iff:
- * 1) x state transints Open -> Rebalancing
- * 2) x parent not transits Open -> Rebalancing
- * 3) x parent parent transits Open -> Rebalancing
- * 4) x left and right child transits Open -> Balancing for skew and split
+ * We need to acquire: x, parent, grandparent, children, and grandchildren
+ * that will be modified during skew/split operations.
  */
-static inline bool rebalancing_acquire(Node *x, Node *acquired[5]) {
-    enum AANodeState expected = Open;
+#define MAX_ACQUIRED_NODES 10
+static inline bool rebalancing_acquire(Node *x, Node *acquired[MAX_ACQUIRED_NODES], enum AANodeState state_from) {
     Node *x_parent = node_atomic_get_parent(x);
     Node *x_parent_parent = node_atomic_get_parent(node_atomic_get_parent(x));
     Node *x_left = node_atomic_get_left(x);
     Node *x_right = node_atomic_get_right(x);
+    Node *x_left_right = (x_left != NIL) ? node_atomic_get_right(x_left) : NIL;
+    Node *x_right_left = (x_right != NIL) ? node_atomic_get_left(x_right) : NIL;
+    Node *x_right_right = (x_right != NIL) ? node_atomic_get_right(x_right) : NIL;
 
-    for (int i = 0; i < 5; i++) {
+    for (int i = 0; i < MAX_ACQUIRED_NODES; i++) {
         acquired[i] = NIL;
     }
 
-    expected = Open;
-    if (!atomic_compare_exchange_weak(&x->state, &expected, Balancing)) {
+    /* Helper function to check if node is already acquired */
+    #define is_already_acquired(node, count) ({ \
+        bool found = false; \
+        for (int j = 0; j < (count); j++) { \
+            if (acquired[j] == (node)) { \
+                found = true; \
+                break; \
+            } \
+        } \
+        found; \
+    })
+
+    int acq_count = 0;
+
+    /* Acquire x */
+    if (!atomic_rebalancing_state_compare_exchange_weak(x, state_from)) {
         return false;
     }
-    acquired[0] = x;
+    acquired[acq_count++] = x;
 
-    if (x_parent != NIL && x_parent != x) {
-        /* Check if x_parent is different from x (can be same after rotations) */
-        expected = Open;
-        if (!atomic_compare_exchange_weak(&x_parent->state, &expected, Balancing)) {
+    /* Acquire parent */
+    if (x_parent != NIL && !is_already_acquired(x_parent, acq_count)) {
+        if (!atomic_rebalancing_state_compare_exchange_weak(x_parent, state_from)) {
             goto release_and_fail;
         }
-        acquired[1] = x_parent;
+        acquired[acq_count++] = x_parent;
     }
 
-    if (x_parent_parent != NIL && x_parent_parent != x && x_parent_parent != x_parent) {
-        /* Check if x_parent_parent is not already acquired */
-        expected = Open;
-        if (!atomic_compare_exchange_weak(
-                &x_parent_parent->state,
-                &expected,
-                Balancing)
-                ) {
+    /* Acquire grandparent */
+    if (x_parent_parent != NIL && !is_already_acquired(x_parent_parent, acq_count)) {
+        if (!atomic_rebalancing_state_compare_exchange_weak(x_parent_parent, state_from)) {
             goto release_and_fail;
         }
-        acquired[2] = x_parent_parent;
+        acquired[acq_count++] = x_parent_parent;
     }
 
-    if (x_left != NIL) {
-        /* Check if x_left is already in acquired array (can happen after rotations) */
-        bool already_acquired = false;
-        for (int i = 0; i < 3; i++) {
-            if (acquired[i] == x_left) {
-                already_acquired = true;
-                break;
-            }
+    /* Acquire left child */
+    if (x_left != NIL && !is_already_acquired(x_left, acq_count)) {
+        if (!atomic_rebalancing_state_compare_exchange_weak(x_left, state_from)) {
+            goto release_and_fail;
         }
-        if (!already_acquired) {
-            expected = Open;
-            if (!atomic_compare_exchange_weak(&x_left->state, &expected, Balancing)) {
-                goto release_and_fail;
-            }
-            acquired[3] = x_left;
-        }
+        acquired[acq_count++] = x_left;
     }
 
-    if (x_right != NIL) {
-        /* Check if x_right is already in acquired array (can happen after rotations) */
-        bool already_acquired = false;
-        for (int i = 0; i < 4; i++) {
-            if (acquired[i] == x_right) {
-                already_acquired = true;
-                break;
-            }
+    /* Acquire right child */
+    if (x_right != NIL && !is_already_acquired(x_right, acq_count)) {
+        if (!atomic_rebalancing_state_compare_exchange_weak(x_right, state_from)) {
+            goto release_and_fail;
         }
-        if (!already_acquired) {
-            expected = Open;
-            if (!atomic_compare_exchange_weak(&x_right->state, &expected, Balancing)) {
-                goto release_and_fail;
-            }
-            acquired[4] = x_right;
-        }
+        acquired[acq_count++] = x_right;
     }
 
+    /* Acquire grandchildren that will be modified in rotations */
+    if (x_left_right != NIL && !is_already_acquired(x_left_right, acq_count)) {
+        if (!atomic_rebalancing_state_compare_exchange_weak(x_left_right, state_from)) {
+            goto release_and_fail;
+        }
+        acquired[acq_count++] = x_left_right;
+    }
+
+    if (x_right_left != NIL && !is_already_acquired(x_right_left, acq_count)) {
+        if (!atomic_rebalancing_state_compare_exchange_weak(x_right_left, state_from)) {
+            goto release_and_fail;
+        }
+        acquired[acq_count++] = x_right_left;
+    }
+
+    if (x_right_right != NIL && !is_already_acquired(x_right_right, acq_count)) {
+        if (!atomic_rebalancing_state_compare_exchange_weak(x_right_right, state_from)) {
+            goto release_and_fail;
+        }
+        acquired[acq_count++] = x_right_right;
+    }
+
+    #undef is_already_acquired
     return true;
 
     release_and_fail:
-    for (int i = 0; i < 5; i++) {
+    for (int i = 0; i < MAX_ACQUIRED_NODES; i++) {
         if (acquired[i] != NIL) {
             node_atomic_set_state(acquired[i], Open);
         }
@@ -211,8 +230,8 @@ static inline bool rebalancing_acquire(Node *x, Node *acquired[5]) {
     return false;
 }
 
-static inline void rebalancing_release(Node* acquired[5]) {
-    for (int i = 0; i < 5; ++i) {
+static inline void rebalancing_release(Node* acquired[MAX_ACQUIRED_NODES]) {
+    for (int i = 0; i < MAX_ACQUIRED_NODES; ++i) {
         if (acquired[i] != NIL) {
             node_atomic_set_state(acquired[i], Open);
         }
@@ -236,7 +255,14 @@ static inline Node * skew(Node *x)
     if (x_level == y_level && x != NIL) {
         Node *y_right = node_atomic_get_right(y);
         node_atomic_set_left(x, y_right);
+        if (y_right != NIL) {
+            node_atomic_set_parent(y_right, x);
+        }
         node_atomic_set_right(y, x);
+        /* Update parent pointers - y is new root of subtree */
+        Node *x_parent = node_atomic_get_parent(x);
+        node_atomic_set_parent(y, x_parent);
+        node_atomic_set_parent(x, y);
         /* we are done */
         return y;
     }
@@ -261,8 +287,15 @@ static inline Node * split(Node *x)
     if (x_level == y_right_level && x != NIL) {
         Node *y_left = node_atomic_get_left(y);
         node_atomic_set_right(x, y_left);
+        if (y_left != NIL) {
+            node_atomic_set_parent(y_left, x);
+        }
         node_atomic_set_left(y, x);
         node_atomic_set_level(y, node_atomic_get_level(y) + 1);
+        /* Update parent pointers - y is new root of subtree */
+        Node *x_parent = node_atomic_get_parent(x);
+        node_atomic_set_parent(y, x_parent);
+        node_atomic_set_parent(x, y);
 
         return y;
     }
@@ -273,10 +306,10 @@ static inline Node * split(Node *x)
 static Node *rebalance_on_insert(Node *current)
 {
     Node* new_head;
-    Node* acquired[5];
+    Node* acquired[MAX_ACQUIRED_NODES];
 
     while (true) {
-        if (rebalancing_acquire(current, acquired))
+        if (rebalancing_acquire(current, acquired, Insert))
             break;
     }
 
@@ -294,7 +327,7 @@ static Node *rebalance_on_insert(Node *current)
 static Node *rebalance_on_remove(Node *current)
 {
     enum AANodeState expected;
-    Node* acquired[5];
+    Node* acquired[MAX_ACQUIRED_NODES];
 
     /*
      * Removal can create a gap in levels,
@@ -304,7 +337,7 @@ static Node *rebalance_on_remove(Node *current)
     /* announce rebalancing by CAS */
     if (current != NIL) {
         while (true) {
-            if (rebalancing_acquire(current, acquired))
+            if (rebalancing_acquire(current, acquired, Open))
                 break;
         }
     }
@@ -357,11 +390,10 @@ static Node * insert_sub(Tree *tree, Node *current, Node *prev, uintptr_t value,
         /*
          * Retry insert if acquiring node failed.
          */
-        if (!atomic_compare_exchange_weak(&node->state, &expected, Insert)) {
-            return NIL;
-        }
+        Assert(node->state == Open);
 
         if (prev != NIL && !atomic_compare_exchange_weak(&prev->state, &expected, Insert)) {
+            printf("fallback\n");
             return NIL;
         }
 
@@ -384,7 +416,11 @@ static Node * insert_sub(Tree *tree, Node *current, Node *prev, uintptr_t value,
     cmp = tree->node_cmp(value, current);
     if (cmp > 0) {
         Node* current_right = node_atomic_get_right(current);
-        bool need_restore = current_right == NIL;
+
+        if (current_right == current) {
+            printf("broken\n");
+            abort();
+        }
 
         Node* tmp = insert_sub(tree, current_right, current, value, node);
 
@@ -395,17 +431,19 @@ static Node * insert_sub(Tree *tree, Node *current, Node *prev, uintptr_t value,
             return NIL;
         }
 
-        node_atomic_set_right(current, tmp);
-        node_atomic_set_parent(tmp, current);
-
-        if (need_restore) {
-            node_atomic_set_state(node, Open);
-            node_atomic_set_state(current, Open);
+        if (tmp != current_right) {
+            node_atomic_set_right(current, tmp);
+            node_atomic_set_parent(tmp, current);
         }
 
     } else if (cmp < 0) {
         Node* current_left = node_atomic_get_left(current);
-        bool need_restore = current_left == NIL;
+
+        // debug
+        if (current_left == current) {
+            printf("broken\n");
+            abort();
+        }
 
         Node* tmp = insert_sub(tree, current_left, current, value, node);
 
@@ -416,12 +454,9 @@ static Node * insert_sub(Tree *tree, Node *current, Node *prev, uintptr_t value,
             return NIL;
         }
 
-        node_atomic_set_left(current, tmp);
-        node_atomic_set_parent(tmp, current);
-
-        if (need_restore) {
-            node_atomic_set_state(node, Open);
-            node_atomic_set_state(current, Open);
+        if (tmp != current_left) {
+            node_atomic_set_left(current, tmp);
+            node_atomic_set_parent(tmp, current);
         }
 
     } else {
@@ -434,17 +469,27 @@ static Node * insert_sub(Tree *tree, Node *current, Node *prev, uintptr_t value,
 
 void aatree_insert(Tree *tree, uintptr_t value, Node *node)
 {
-    Node* inserted = NIL;
-    bool first_insert = tree->root == NIL;
-
-    while (inserted == NIL) {
-        inserted = insert_sub(tree, tree->root, NIL, value, node);
+    /* Ensure node is in Open state before insertion */
+    node_atomic_set_state(node, Open);
+    
+    /* Acquire write lock - serializes insertions but keeps internal algorithm lock-free */
+    pthread_rwlock_wrlock(&tree->rw_lock);
+    
+    while (true) {
+        Node* old_root = atomic_load_explicit(&tree->root, memory_order_acquire);
+        Node* new_root = insert_sub(tree, old_root, NIL, value, node);
+        
+        if (new_root == NIL) {
+            /* CAS failed in insert_sub, retry */
+            continue;
+        }
+        
+        /* Update root */
+        atomic_store_explicit(&tree->root, new_root, memory_order_release);
+        break;
     }
-    tree->root = inserted;
-
-    if (first_insert) {
-        node_atomic_set_state(tree->root, Open);
-    }
+    
+    pthread_rwlock_unlock(&tree->rw_lock);
 }
 
 /*
@@ -570,6 +615,7 @@ void aatree_destroy(Tree *tree)
     /* reset tree */
     tree->root = NIL;
     tree->count = 0;
+    pthread_rwlock_destroy(&tree->rw_lock);
 }
 
 /* prepare tree */
@@ -579,6 +625,7 @@ void aatree_init(Tree *tree, aatree_cmp_f cmpfn, aatree_walker_f release_cb)
     tree->count = 0;
     tree->node_cmp = cmpfn;
     tree->release_cb = release_cb;
+    pthread_rwlock_init(&tree->rw_lock, NULL);
 }
 
 /*
@@ -586,17 +633,100 @@ void aatree_init(Tree *tree, aatree_cmp_f cmpfn, aatree_walker_f release_cb)
  */
 Node *aatree_search(Tree *tree, uintptr_t value)
 {
-    Node *current = tree->root;
+    /* Acquire read lock - allows concurrent readers */
+    pthread_rwlock_rdlock(&tree->rw_lock);
+    
+    Node *current = atomic_load_explicit(&tree->root, memory_order_acquire);
 
-    /* not allowed to visit Balancing stated nodes */
+    /* Traverse tree */
     while (current != NIL) {
         int cmp = tree->node_cmp(value, current);
         if (cmp > 0)
             current = node_atomic_get_right(current);
         else if (cmp < 0)
             current = node_atomic_get_left(current);
-        else
+        else {
+            pthread_rwlock_unlock(&tree->rw_lock);
             return current;
+        }
     }
+    
+    pthread_rwlock_unlock(&tree->rw_lock);
     return NULL;
 }
+
+/*
+ * Print tree snapshot with state information (thread-safe)
+ */
+
+static const char* state_to_string(enum AANodeState state)
+{
+    switch (state) {
+        case Open: return "Open";
+        case Insert: return "Insert";
+        case Balancing: return "Balancing";
+        default: return "Unknown";
+    }
+}
+
+static void print_node_snapshot(Node *node, void (*value_printer)(Node *), int depth, const char* prefix, int* node_count)
+{
+    if (node == NIL) {
+        return;
+    }
+
+    /* Atomically read all node properties for consistent snapshot */
+    Node *left = node_atomic_get_left(node);
+    Node *right = node_atomic_get_right(node);
+    Node *parent = node_atomic_get_parent(node);
+    int level = node_atomic_get_level(node);
+    enum AANodeState state = node_atomic_get_state(node);
+
+    (*node_count)++;
+
+    /* Print indentation */
+    for (int i = 0; i < depth; i++) {
+        printf("  ");
+    }
+
+    /* Print node information */
+    printf("%s[Node@%p] level=%d state=%s parent=%p",
+           prefix, (void*)node, level, state_to_string(state), (void*)parent);
+
+    /* If value printer provided, call it */
+    if (value_printer) {
+        printf(" value=");
+        value_printer(node);
+    }
+    printf("\n");
+
+    /* Recursively print children */
+    if (left != NIL) {
+        print_node_snapshot(left, value_printer, depth + 1, "L:", node_count);
+    }
+    if (right != NIL) {
+        print_node_snapshot(right, value_printer, depth + 1, "R:", node_count);
+    }
+}
+
+void aatree_print_snapshot(struct AATree *tree, void (*value_printer)(struct AANode *))
+{
+    int count = atomic_load_explicit(&tree->count, memory_order_seq_cst);
+    int printed_nodes = 0;
+
+    printf("\n=== AA-Tree Snapshot ===\n");
+    printf("Tree root: %p\n", (void*)tree->root);
+    printf("Node count: %d\n", count);
+    printf("========================\n");
+
+    if (tree->root == NIL) {
+        printf("(empty tree)\n");
+    } else {
+        print_node_snapshot(tree->root, value_printer, 0, "ROOT:", &printed_nodes);
+    }
+
+    printf("========================\n");
+    printf("Printed %d nodes\n", printed_nodes);
+    printf("\n");
+}
+
